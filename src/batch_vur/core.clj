@@ -1,0 +1,168 @@
+(ns batch-vur.core
+  (:require [clojure.core.async :refer [chan >!! <!! close!]]
+            [onyx.plugin.core-async :refer [take-segments!]]
+            [cheshire.core :as json]
+            [onyx.plugin.kafka]
+            [onyx.plugin.seq]
+            [onyx.api]))
+
+(defn serialize-message-json [segment]
+  (.getBytes (json/generate-string segment)))
+
+(def lock (Object.))
+
+(defn sync-logger  [str]
+  (locking  lock
+     (println str)))
+
+(defn transform-into-beregn-msg [ejendom-segment]
+  (let [msg  {:message (merge ejendom-segment  {:id (java.util.UUID/randomUUID)})}]
+    (sync-logger (str "vur-ejd-id=" (:vur-ejd-id ejendom-segment) ", id=" (get-in msg [:message :id])))
+    msg))
+
+(def workflow
+  [[:in :beregn-msg]
+  #_[:beregn-msg :out]
+   [:beregn-msg :write-messages]])
+
+
+(def capacity 1000)
+
+(def output-chan (chan capacity))
+
+(def batch-size 10)
+
+(defn catalog [{:keys [topic kafka-zookeeper]} ]
+  [{:onyx/name :in
+	:onyx/plugin :onyx.plugin.seq/input
+	:onyx/type :input
+	:onyx/medium :seq
+	:seq/checkpoint? true
+	:onyx/batch-size batch-size
+	:onyx/max-peers 1
+	:onyx/doc "Reads segments from seq"}
+
+   {:onyx/name :beregn-msg
+	:onyx/fn ::transform-into-beregn-msg
+    :onyx/uniqueness-key :vur-ejd-id
+	:onyx/type :function
+	:onyx/batch-size 10}
+
+   {:onyx/name :write-messages
+	:onyx/plugin :onyx.plugin.kafka/write-messages
+	:onyx/type :output
+	:onyx/medium :kafka
+	:kafka/topic   topic
+    :kafka/zookeeper kafka-zookeeper
+    :kafka/serializer-fn ::serialize-message-json
+	:kafka/request-size 307200
+	:onyx/batch-size batch-size
+	:onyx/doc "Writes messages to a Kafka topic"}
+
+   {:onyx/name :out
+	:onyx/plugin :onyx.plugin.core-async/output
+	:onyx/type :output
+	:onyx/medium :core.async
+	:onyx/max-peers 1
+	:onyx/batch-size batch-size
+	:onyx/doc "Writes segments to a core.async channel"}
+   ])
+
+
+
+(defn inject-out-ch [event lifecycle]
+  {:core.async/chan output-chan})
+
+(def out-calls
+  {:lifecycle/before-task-start inject-out-ch})
+
+(defn inject-in-reader [event lifecycle]
+  (prn "filename "  (:buffered-reader/filename lifecycle) (type (clojure.java.io/resource (:buffered-reader/filename lifecycle))) )
+  (let [rdr (clojure.java.io/reader (clojure.java.io/resource (:buffered-reader/filename lifecycle)))]
+    {:seq/rdr rdr
+     :seq/seq (take 10000 (map #(assoc {} :vur-ejd-id (Integer. %)) (line-seq (java.io.BufferedReader. rdr))))}))
+
+(defn close-reader [event lifecycle]
+  (.close (:seq/rdr event)))
+
+(def in-calls-seq
+  {:lifecycle/before-task-start inject-in-reader
+   :lifecycle/after-task-stop close-reader})
+
+(def lifecycles
+  [
+   {:lifecycle/task :in
+	:buffered-reader/filename "vur-ejd-ids.edn"
+	:lifecycle/calls ::in-calls-seq}
+
+   {:lifecycle/task :in
+	:lifecycle/calls :onyx.plugin.seq/reader-calls}
+
+   {:lifecycle/task :write-messages
+	:lifecycle/calls :onyx.plugin.kafka/write-messages-calls}
+
+   {:lifecycle/task :out
+	:lifecycle/calls :flat-workflow.core/out-calls}
+   {:lifecycle/task :out
+	:lifecycle/calls :onyx.plugin.core-async/writer-calls}])
+
+
+
+
+(comment
+(def id (java.util.UUID/randomUUID))
+(def env-config
+  {:zookeeper/address "127.0.0.1:2181"
+   :zookeeper/server? false
+   :zookeeper.server/port 2181
+   :onyx/tenancy-id id})
+
+(def peer-config
+  {:zookeeper/address "127.0.0.1:2181"
+   :onyx/tenancy-id id
+   :onyx.peer/job-scheduler :onyx.job-scheduler/balanced
+   :onyx.messaging/impl :aeron
+   :onyx.messaging/peer-port 40201
+   :onyx.messaging/bind-addr "localhost"})
+
+(def env (onyx.api/start-env env-config))
+
+
+
+(def peer-group (onyx.api/start-peer-group peer-config))
+
+(def n-peers (count (set (mapcat identity workflow))))
+
+(def v-peers (onyx.api/start-peers n-peers peer-group))
+
+)
+
+(defn shutdown-onyx [onyx-system]
+  (doseq [p (:virtual-peers onyx-system)]
+    (onyx.api/shutdown-peer p))
+  (onyx.api/shutdown-peer-group (:peer-group onyx-system)))
+
+(defn close-peer-on-job-completion [system-config job-id]
+  (future (onyx.api/await-job-completion (:config (:peer-group system-config)) job-id)
+          (prn "job-id: " job-id", is now finished! Exiting.")
+          (shutdown-onyx system-config)
+          ; waiting for aeron to cleanup
+          (Thread/sleep 500)
+          (System/exit 0)))
+
+
+(defn submit-jobs! [peer-config config]
+  (let [jobs (onyx.api/submit-job
+               (:config (:peer-group peer-config))
+               {:catalog (catalog config) :workflow workflow :lifecycles lifecycles
+                :task-scheduler :onyx.task-scheduler/balanced})]
+    (close-peer-on-job-completion peer-config (:job-id jobs))
+    jobs))
+
+
+(defn start-onyx [tenancy-id config]
+  (let [peer-config (assoc (:peer-config config) :onyx/tenancy-id tenancy-id)
+        peer-group (onyx.api/start-peer-group peer-config)
+        virtual-peers (onyx.api/start-peers (:number-of-peers config) peer-group #_monitoring-config)]
+    {:peer-group peer-group :virtual-peers virtual-peers :peer-config peer-config}))
+
