@@ -1,0 +1,7 @@
+in resource/config.edn and vur-ejd-ids.edn which contains no duplicated ids (10000)
+
+
+  lein uberjar 
+  docker-compose build
+  docker-compose up 
+  docker-compose scale batch_vur=2
